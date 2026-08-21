@@ -1,5 +1,6 @@
 export { X402CoinbaseAdapter } from "./adapter.ts";
 export type {
+  ConsumingPaymentVerifier,
   SettlementConfirmer,
   X402CoinbaseAdapterConfig,
   X402SupportedNetwork,

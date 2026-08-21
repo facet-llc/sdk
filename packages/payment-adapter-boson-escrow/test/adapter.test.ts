@@ -111,7 +111,7 @@ function requirements(over: Partial<EscrowPaymentRequirements> = {}): EscrowPaym
 
 /** A structurally-valid escrow X-PAYMENT (real decodeXPaymentHeader parses
  *  it; sig verification is validatePaymentPayload's job, which we mock). */
-function xPaymentHeader(action = "boson-createOfferAndCommit"): string {
+function xPaymentHeader(action = "boson-createOfferAndCommit", buyer = BUYER): string {
   const payload = {
     x402Version: 1,
     scheme: "escrow",
@@ -120,9 +120,9 @@ function xPaymentHeader(action = "boson-createOfferAndCommit"): string {
       action,
       tokenAuthStrategy: "none",
       offerRef: { fullOffer: { price: "1230000" }, sellerSig: HEX32 },
-      buyer: BUYER,
+      buyer,
       metaTx: {
-        from: BUYER,
+        from: buyer,
         nonce: "1",
         functionName: "executeMetaTransaction",
         functionSignature: "0xdeadbeef",
@@ -271,6 +271,50 @@ describe("BosonEscrowAdapter.verifyAuthority", () => {
     // validatePaymentPayload was consulted with our chainId.
     expect(h.validateFn).toHaveBeenCalledTimes(1);
     expect(h.validateFn.mock.calls[0]?.[0]).toMatchObject({ chainId: 84532 });
+  });
+
+  // ─── L3B P1(b): commit-signer recovery for wallet binding ────────────────────
+  // Once validatePaymentPayload returns ok, its rule 8 (BAD_META_TX_SIGNATURE)
+  // has recovered the commit meta-tx signer and asserted
+  // buyer == metaTx.from == recovered, so the adapter surfaces `payload.buyer`
+  // as `payer`. The Terminal binds this to a wallet-anchored buyer KYA
+  // (assertPayerBound) BEFORE the on-chain commit escrows funds. Before this
+  // change Boson surfaced no payer and every wallet-bound buyer failed closed.
+
+  it("surfaces the recovered commit signer as `payer` for a valid commit", async () => {
+    const res = await makeAdapter().verifyAuthority(base());
+    expect(res.kind).toBe("ok");
+    if (res.kind !== "ok") return;
+    // The decoded commit buyer (== metaTx.from, recovered by validate rule 8).
+    expect(res.value.payer).toBe(BUYER);
+  });
+
+  it("derives `payer` from the decoded commit buyer, not a hardcoded value", async () => {
+    const other = "0x3333333333333333333333333333333333333333";
+    const res = await makeAdapter().verifyAuthority({
+      ...base(),
+      authority: {
+        x_payment: xPaymentHeader("boson-createOfferAndCommit", other),
+        requirements: requirements(),
+      },
+    });
+    expect(res.kind).toBe("ok");
+    if (res.kind !== "ok") return;
+    // Binding target tracks the signature-verified payload: a buyer KYA whose
+    // payer_wallet claims a different address fails assertPayerBound upstream.
+    expect(res.value.payer).toBe(other);
+  });
+
+  it("yields no ok value (so no bindable payer) when the meta-tx signature is bad", async () => {
+    // Rule 8 rejects a forged/mismatched commit signer, so a spoofed buyer can
+    // never reach the payer surface.
+    h.validateFn.mockResolvedValue({ ok: false, rule: 8, code: "BAD_META_TX_SIGNATURE" });
+    const res = await makeAdapter().verifyAuthority(base());
+    expect(res).toMatchObject({
+      kind: "error",
+      code: "UNAUTHORIZED",
+      native_code: "BAD_META_TX_SIGNATURE",
+    });
   });
 
   it("rejects a non-USDC currency", async () => {

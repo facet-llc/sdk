@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { keccak256, toBytes } from "viem";
 
 import {
+  buildLineOfferMetadata,
   buildOfferMetadata,
   canonicalStringify,
   decodeMetadataPath,
@@ -99,5 +100,59 @@ describe("buildOfferMetadata — BPIP-1 BASE offer metadata", () => {
     expect(decodeMetadataPath("!!!not-base64!!!")).toBeNull();
     expect(decodeMetadataPath(encodeMetadataPath("not json"))).toBeNull();
     expect(decodeMetadataPath(encodeMetadataPath(JSON.stringify({ type: "NOPE" })))).toBeNull();
+  });
+});
+
+const COMMON = { exchangeToken: ASSET, network: NETWORK, metadataBaseUri: BASE };
+
+describe("buildLineOfferMetadata: per-line offers (S2)", () => {
+  it("threads the line's own product into the offer", () => {
+    const built = buildLineOfferMetadata(
+      { product: { name: "Line A SKU", id: "sku-a" }, lineNonce: "co_1:0" },
+      COMMON,
+    );
+    expect(built.metadata.name).toBe("Line A SKU");
+    const traits = Object.fromEntries(built.metadata.attributes.map((a) => [a.traitType, a.value]));
+    expect(traits["Product ID"]).toBe("sku-a");
+  });
+
+  it("uses the line nonce as the offerNonce (on the document, not the traits)", () => {
+    const built = buildLineOfferMetadata({ product: { name: "X" }, lineNonce: "co_1:3" }, COMMON);
+    expect(built.metadata.offerNonce).toBe("co_1:3");
+    expect(built.metadata.attributes.some((t) => /nonce/i.test(t.traitType))).toBe(false);
+  });
+
+  it("same product + different line nonce produce DISTINCT offers (no OfferSoldOut collision)", () => {
+    const l0 = buildLineOfferMetadata(
+      { product: { name: "Same SKU" }, lineNonce: "co_1:0" },
+      COMMON,
+    );
+    const l1 = buildLineOfferMetadata(
+      { product: { name: "Same SKU" }, lineNonce: "co_1:1" },
+      COMMON,
+    );
+    expect(l0.metadataHash).not.toBe(l1.metadataHash);
+    expect(l0.metadataUri).not.toBe(l1.metadataUri);
+  });
+
+  it("is deterministic per line: the same line rebuilt is byte-identical (idempotent retry)", () => {
+    const line = { product: { name: "Retry me", id: "sku-r" }, lineNonce: "co_9:2" };
+    const first = buildLineOfferMetadata(line, COMMON);
+    const again = buildLineOfferMetadata(line, COMMON);
+    expect(first.metadataHash).toBe(again.metadataHash);
+    expect(first.metadataUri).toBe(again.metadataUri);
+    expect(first.canonicalJson).toBe(again.canonicalJson);
+  });
+
+  it("equals buildOfferMetadata with product + nonce (thin wrapper, no drift)", () => {
+    const line = { product: { name: "Parity", id: "p" }, lineNonce: "co_1:5" };
+    const viaWrapper = buildLineOfferMetadata(line, COMMON);
+    const viaDirect = buildOfferMetadata({
+      ...COMMON,
+      product: line.product,
+      nonce: line.lineNonce,
+    });
+    expect(viaWrapper.metadataHash).toBe(viaDirect.metadataHash);
+    expect(viaWrapper.canonicalJson).toBe(viaDirect.canonicalJson);
   });
 });

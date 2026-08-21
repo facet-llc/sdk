@@ -123,6 +123,42 @@ export type SettlementConfirmer = (params: {
   readonly minValueAtomic: string;
 }) => Promise<{ readonly ok: boolean; readonly reason?: string }>;
 
+/** Prove, on-chain, whether an EIP-3009 authorization `(from, nonce)` actually PAID the
+ *  merchant. This disambiguates a facilitator settle that failed or timed out WITHOUT a
+ *  usable tx hash: the facilitator can broadcast the transfer and land it on-chain, then
+ *  have its HTTP response drop or return `success:false`.
+ *
+ *  CRITICAL: a consumed nonce is NOT proof of payment, and neither is "the consuming tx
+ *  contains some Transfer to payTo". EIP-3009 tracks nonce CONSUMPTION only; it does not
+ *  bind `(to, value)` to the nonce, and the SIGNER chooses the nonce, so a buyer can (a)
+ *  consume one nonce with a self-transfer for 0, or (b) bundle one real payment plus many
+ *  zero-value burn-nonces in a single tx, then drive each burn-nonce's failed settle into
+ *  reconciliation and point it at the co-located real Transfer (buy-one-get-many). The
+ *  only sound proof is the transfer THIS authorization performed. USDC's FiatToken emits
+ *  `AuthorizationUsed(from, nonce)` immediately BEFORE the paired `Transfer` inside one
+ *  `_transferWithAuthorization` call (verified against Circle's EIP3009.sol), so the
+ *  verifier resolves the tx that consumed `(from, nonce)`, finds that AuthorizationUsed
+ *  log, and asserts the very next log is a full-value `Transfer(from = authorizer, to =
+ *  payTo, value >= amount)`. Returns `{ settled: txHash }` when that holds, else
+ *  `{ settled: null }` (unused nonce, or the consuming transfer did not pay payTo).
+ *  Injected by the Terminal (viem `eth_getLogs` + receipt) so this package stays RPC-free;
+ *  MUST be set before `FACET_X402_NETWORK=base` (mainnet). When absent, or when the lookup
+ *  throws, an ambiguous settle is reported UNCONFIRMED (non-retryable), never a clean
+ *  failure. */
+export type ConsumingPaymentVerifier = (params: {
+  /** The EIP-3009 authorizer (payload `authorization.from`). */
+  readonly from: `0x${string}`;
+  /** The EIP-3009 authorization nonce (payload `authorization.nonce`, bytes32). */
+  readonly nonce: `0x${string}`;
+  readonly network: X402SupportedNetwork;
+  /** USDC contract whose `AuthorizationUsed` + `Transfer` logs are read. */
+  readonly asset: `0x${string}`;
+  /** Server-resolved merchant payout address the paired Transfer must credit. */
+  readonly payTo: `0x${string}`;
+  /** Server-derived amount (atomic) the paired Transfer value must be at least. */
+  readonly minValueAtomic: string;
+}) => Promise<{ readonly settled: `0x${string}` | null }>;
+
 export interface X402CoinbaseAdapterConfig {
   /** The x402 network this adapter instance handles. One adapter per
    *  network — the Terminal dispatcher picks the right instance based
@@ -161,6 +197,13 @@ export interface X402CoinbaseAdapterConfig {
    *  Undefined = facilitator-trust only (current testnet behavior). MUST be
    *  set before `FACET_X402_NETWORK=base` (mainnet). */
   readonly confirmSettlement?: SettlementConfirmer;
+  /** Prove on-chain whether a failed/timed-out settle's EIP-3009 authorization actually
+   *  paid `payTo`, by asserting the `Transfer` paired with its `AuthorizationUsed` event
+   *  credited `payTo` the amount. Used to classify an ambiguous settle (settled vs not vs
+   *  unknown); a consumed nonce, or a merely co-located Transfer to payTo, is never
+   *  treated as payment. Undefined = no re-check (ambiguous settles report UNCONFIRMED).
+   *  MUST be set before `FACET_X402_NETWORK=base` (mainnet). */
+  readonly verifyConsumingPayment?: ConsumingPaymentVerifier;
   /** Clock injection for deterministic validity-window tests. */
   readonly now?: () => number;
 }
@@ -174,6 +217,7 @@ export class X402CoinbaseAdapter implements FacetPaymentRailAdapter {
   private readonly defaultDescription: string;
   private readonly maxAuthWindowSeconds: number | undefined;
   private readonly confirmSettlement: SettlementConfirmer | undefined;
+  private readonly verifyConsumingPayment: ConsumingPaymentVerifier | undefined;
   private readonly now: () => number;
 
   constructor(cfg: X402CoinbaseAdapterConfig) {
@@ -201,6 +245,7 @@ export class X402CoinbaseAdapter implements FacetPaymentRailAdapter {
     this.defaultDescription = cfg.defaultDescription ?? "Facet Terminal x402 payment";
     this.maxAuthWindowSeconds = cfg.maxAuthWindowSeconds;
     this.confirmSettlement = cfg.confirmSettlement;
+    this.verifyConsumingPayment = cfg.verifyConsumingPayment;
     this.now = cfg.now ?? (() => Date.now());
 
     const facilitatorUrl: string = facilitatorConfig.url;
@@ -299,6 +344,9 @@ export class X402CoinbaseAdapter implements FacetPaymentRailAdapter {
       value: {
         authority_handle: evm.authorization.nonce,
         expires_at: new Date(Number(evm.authorization.validBefore) * 1000).toISOString(),
+        // L3B Phase 0: surface the ERC-3009 signer so the Terminal can bind a
+        // buyer KYA wallet claim to whoever actually pays, before capture.
+        payer: evm.authorization.from,
       },
     };
   }
@@ -310,6 +358,56 @@ export class X402CoinbaseAdapter implements FacetPaymentRailAdapter {
       kind: "ok",
       value: { reservation_active: false, reserved_until: null },
     };
+  }
+
+  /** Classify a settle attempt that did NOT return a confirmed success, by proving (or
+   *  refuting) on-chain that the merchant was actually paid BY THIS authorization:
+   *    { settled: txHash }  the Transfer paired with this authorization's AuthorizationUsed
+   *                         credited `payTo` a full-value Transfer >= amount; txHash is
+   *                         the consuming tx.
+   *    "not_settled"        the nonce is unused, OR the transfer this authorization
+   *                         performed did NOT pay `payTo` the amount (a self-transfer, a
+   *                         zero-value burn-nonce, etc.), so no money reached the merchant.
+   *    "unknown"            no verifier injected, or the on-chain read threw (undetermined).
+   *  A consumed nonce alone is NOT proof of payment, and neither is a merely co-located
+   *  Transfer to payTo in the same tx: the signer picks the nonce, so it can be consumed by
+   *  a different transfer, and a signer can bundle a real payment plus burn-nonces in one
+   *  tx. The verifier binds the proof to the transfer THIS authorization performed (the log
+   *  adjacent to its AuthorizationUsed), closing both the self-transfer decline-as-settled
+   *  path and the buy-one-get-many bundling path. */
+  private async classifyAmbiguousSettle(
+    evm: ExactEvmPayload,
+    expectedPayTo: `0x${string}`,
+    amountAtomic: string,
+  ): Promise<{ readonly settled: string } | "not_settled" | "unknown"> {
+    if (this.verifyConsumingPayment === undefined) return "unknown";
+    try {
+      const { settled } = await this.verifyConsumingPayment({
+        from: evm.authorization.from as `0x${string}`,
+        nonce: evm.authorization.nonce as `0x${string}`,
+        network: this.network,
+        asset: USDC_ADDRESSES[this.network],
+        payTo: expectedPayTo,
+        minValueAtomic: amountAtomic,
+      });
+      return settled !== null ? { settled } : "not_settled";
+    } catch {
+      return "unknown";
+    }
+  }
+
+  private captured(settlementId: string): RailAdapterResult<CaptureOk> {
+    return {
+      kind: "ok",
+      value: { settlement_id: settlementId, settled_at: new Date(this.now()).toISOString() },
+    };
+  }
+
+  /** A settle whose on-chain outcome could not be determined. Non-retryable on purpose:
+   *  the transfer MAY have executed, so a retry (a fresh authorization) could double-pay.
+   *  native_code "settlement_unconfirmed" flags it for reconciliation, never auto-retry. */
+  private unconfirmed(message: string): RailAdapterResult<CaptureOk> {
+    return makeError("SETTLEMENT_FAILED", message, false, "settlement_unconfirmed");
   }
 
   async capture(input: CaptureInput): Promise<RailAdapterResult<CaptureOk>> {
@@ -356,21 +454,50 @@ export class X402CoinbaseAdapter implements FacetPaymentRailAdapter {
     try {
       settleResponse = await this.facilitatorClient.settle(decoded.payload, requirements);
     } catch (e) {
-      return {
-        kind: "error",
-        code: "SETTLEMENT_FAILED",
-        message: e instanceof Error ? e.message : String(e),
-        retryable: true,
-      };
+      // The facilitator threw AFTER possibly broadcasting the transfer (a dropped or
+      // timed-out HTTP response). The transfer may already have landed on-chain, so this
+      // is NOT necessarily a clean failure. Prove on-chain whether the merchant was paid
+      // before deciding, so a real payment is never booked as a retryable failure (which
+      // would orphan the funds and invite a double-paying retry).
+      const msg = e instanceof Error ? e.message : String(e);
+      const state = await this.classifyAmbiguousSettle(
+        evm,
+        expectedPayTo as `0x${string}`,
+        String(input.amount.amount),
+      );
+      if (state !== "not_settled" && state !== "unknown") return this.captured(state.settled);
+      if (state === "not_settled") {
+        return { kind: "error", code: "SETTLEMENT_FAILED", message: msg, retryable: true };
+      }
+      return this.unconfirmed(`settle request failed and on-chain state is unconfirmed: ${msg}`);
     }
 
     if (!settleResponse.success) {
-      return makeError(
-        "SETTLEMENT_FAILED",
-        settleResponse.errorReason ?? "Facilitator declined settlement",
-        settleResponse.errorReason === "duplicate_settlement",
-        settleResponse.errorReason,
+      // A facilitator "duplicate settlement" means this authorization was ALREADY settled;
+      // preserve that signal verbatim for the dispatcher's idempotency handling.
+      if (settleResponse.errorReason === "duplicate_settlement") {
+        return makeError(
+          "SETTLEMENT_FAILED",
+          "Facilitator reported a duplicate settlement",
+          true,
+          "duplicate_settlement",
+        );
+      }
+      // Otherwise the facilitator declined. It may still have broadcast the transfer (an
+      // inclusion wait that timed out after the tx landed), so if the merchant was
+      // PROVABLY paid on-chain (nonce consumed AND that tx credited payTo the amount), book
+      // it settled rather than orphaning the funds. Otherwise return the decline verbatim:
+      // an explicit decline with no proven payment means no money reached the merchant (a
+      // consumed-but-not-to-payTo nonce is not a payment, and the resolver+confirmer are
+      // mandatory on mainnet, so a landed-and-paid settle is upgraded here, not lost).
+      const reason = settleResponse.errorReason ?? "Facilitator declined settlement";
+      const state = await this.classifyAmbiguousSettle(
+        evm,
+        expectedPayTo as `0x${string}`,
+        String(input.amount.amount),
       );
+      if (state !== "not_settled" && state !== "unknown") return this.captured(state.settled);
+      return makeError("SETTLEMENT_FAILED", reason, false, settleResponse.errorReason);
     }
 
     // Independently confirm the settlement landed
@@ -399,12 +526,20 @@ export class X402CoinbaseAdapter implements FacetPaymentRailAdapter {
           minValueAtomic: String(input.amount.amount),
         });
       } catch (e) {
-        return {
-          kind: "error",
-          code: "SETTLEMENT_FAILED",
-          message: e instanceof Error ? e.message : String(e),
-          retryable: true,
-        };
+        // Our independent confirmer RPC threw. The facilitator reported success WITH a tx,
+        // so the transfer likely landed and a retry could double-pay. Re-prove payment
+        // before deciding: if the consuming tx provably credited payTo, book it; otherwise
+        // report unconfirmed, never a clean retryable failure.
+        const msg = e instanceof Error ? e.message : String(e);
+        const state = await this.classifyAmbiguousSettle(
+          evm,
+          expectedPayTo as `0x${string}`,
+          String(input.amount.amount),
+        );
+        if (state !== "not_settled" && state !== "unknown") return this.captured(state.settled);
+        return this.unconfirmed(
+          `settlement confirmation failed and on-chain state is unconfirmed: ${msg}`,
+        );
       }
       if (!confirmation.ok) {
         return makeError(

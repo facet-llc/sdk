@@ -79,6 +79,10 @@ export type FacetErrorCode =
   // fulfillment
   | "FULFILLMENT_REQUIRED"
   | "UNDELIVERABLE"
+  // safety (agent-safety layer): the resolved SKU is in a prohibited category
+  // class the Terminal will not transact. Enforced at quote AND settle;
+  // non-retryable.
+  | "PROHIBITED_GOODS"
   // server
   | "INTERNAL_ERROR";
 
@@ -820,7 +824,11 @@ export interface OrderLineItem {
 
 export interface Order {
   readonly order_id: string;
-  readonly reservation_id: string;
+  // NULL for a RAIL-NATIVE order: one written by a settlement rail's own commit
+  // (a Boson escrow commit through the payments dispatch) rather than by settling
+  // a Facet reservation. Those never had a reservation, so this reports null
+  // rather than a fabricated id.
+  readonly reservation_id: string | null;
   readonly status: OrderStatus;
   readonly amount: number;
   readonly currency: string;
@@ -846,6 +854,10 @@ export interface OrderAttributes {
   readonly gift_message?: string;
   readonly delivery_date?: string; // ISO date, YYYY-MM-DD
   readonly occasion?: string;
+  // Opt-in shipping-notification email. Mapped to the merchant order's customer email
+  // (Woo billing.email, Shopify order.email) so the store can email the buyer shipping and
+  // tracking updates. Fulfillment PII only; never priced, never used for the receipt.
+  readonly contact_email?: string;
 }
 
 export interface SettleRequest {
@@ -964,6 +976,137 @@ export interface GetOrderRequest {
 
 export type GetOrderResponse = Order;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// get_receipt: POST /v1/get_receipt
+//
+// Mints, on demand, a portable settlement receipt for one of the caller's
+// settled orders: a compact JWS (RFC 7515, EdDSA) signed by the Terminal's
+// response-signing key. Unlike an order read, a receipt verifies on its own
+// against the issuer's published JWKS with a stock JOSE library and no call back
+// to Facet, so an agent can hand it to a third party as evidence a settlement
+// occurred. Same auth and owner-scoping as get_order.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface GetReceiptRequest {
+  readonly order_id: string;
+  // Optional wallet-authorized re-fetch. A receipt is normally returned only to
+  // the ephemeral agent aid that made the purchase; once that KYA expires the aid
+  // cannot be reproduced. A caller may instead prove control of the order's
+  // durable payer wallet with an EIP-191 signature over the canonical challenge
+  // (see getReceipt for the exact message and checks). Absent means aid-scoped.
+  readonly wallet_auth?: WalletReceiptAuth;
+}
+
+// The payer-wallet proof for a wallet-authorized receipt re-fetch. The signature
+// is EIP-191 (personal_sign) over
+// `Facet receipt refetch\norder: <order_id>\nwallet: <wallet>\nissued_at: <issued_at>\nnonce: <nonce>`.
+// order_id + wallet bind the proof so a captured signature cannot be reused for a
+// different order or wallet; issued_at bounds freshness and the nonce is consumed
+// single-use server-side to bar replay.
+export interface WalletReceiptAuth {
+  readonly wallet: string;
+  readonly issued_at: number;
+  readonly nonce: string;
+  readonly signature: string;
+}
+
+// One receipt, ready to drop into a UCP verifier-attestation envelope's
+// `signals` map. `jws` is the compact serialization; `provider_jwks` is a
+// NON-NORMATIVE hint at where the signing key is published (a verifier's pinned
+// key source always wins).
+export interface ReceiptEnvelopeEntry {
+  readonly format: string;
+  readonly jws: string;
+  readonly kid: string;
+  readonly provider_jwks: string;
+}
+
+export interface GetReceiptResponse {
+  readonly receipt: ReceiptEnvelopeEntry;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// get_signatures: the full signature audit trail for an order you own.
+//
+// Where get_receipt mints ONE signed receipt, get_signatures returns the whole
+// provenance chain the Terminal recorded for an order: the outbound Facet
+// Ed25519 response signatures and counterparty attestations, plus the inbound
+// authorizations a counterparty presented (the buyer KYA by hash, the UCP
+// platform RFC 9421 signature, the ERC-3009 payment authorization, the Boson
+// seller offer). Same auth and owner-scoping as get_receipt, including the
+// payer-wallet fallback, but bound to its own challenge so a proof cannot be
+// replayed onto the receipt read (or vice versa).
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface GetSignaturesRequest {
+  readonly order_id: string;
+  // Optional wallet-authorized re-fetch, identical in shape to get_receipt's but
+  // signed over the DISTINCT canonical challenge
+  // `Facet signatures refetch\norder: <order_id>\nwallet: <wallet>\nissued_at: <issued_at>\nnonce: <nonce>`
+  // (see getSignatures for the exact message and checks). A platform-originated
+  // order is owned by an origin aid rather than the buyer, so a buyer who paid it
+  // reads the trail through this wallet proof. Absent means aid-scoped.
+  readonly wallet_auth?: WalletReceiptAuth;
+}
+
+// One row of the outbound Facet signature ledger (public.signatures). A
+// party='facet' row is Facet's Ed25519 signature over the response it returned,
+// with the hex request/response hashes and the hash-chain links; a
+// party='merchant'|'agent' row is a post-settlement fulfilment attestation. All
+// bytea fields are lowercase hex; prev_hash is null at the chain root.
+export interface OrderSignatureRecord {
+  readonly party: "facet" | "merchant" | "agent";
+  readonly signing_key_id: string;
+  readonly request_hash: string;
+  readonly response_hash: string;
+  readonly prev_hash: string | null;
+  readonly this_hash: string;
+  readonly signature: string;
+  readonly attestation: string | null;
+  readonly attestation_strength: string | null;
+  readonly attestation_jws: string | null;
+  readonly signer_ref: string | null;
+  readonly signed_at: string;
+}
+
+// One row of the inbound authorization ledger (public.order_authorizations): a
+// credential the counterparty presented and Facet verified (or, for the Boson
+// seller offer, attested). `artifact` is the credential verbatim for the RFC
+// 9421 platform signature, the ERC-3009 authorization, and the seller offer, and
+// is ALWAYS null for a KYA, whose value is never returned; `artifact_sha256` (hex)
+// is the KYA's integrity anchor. The encrypted-at-rest KYA slot is never exposed.
+export interface OrderAuthorizationRecord {
+  readonly leg: "create" | "complete";
+  // The full order_authorizations.kind domain (base table plus the kya owner/buyer
+  // split and the autonomous_delegation addition). `kya`, `kya_owner`, and
+  // `kya_buyer` are all hash-only (artifact null); the rest carry a verbatim
+  // artifact. The trailing `string` keeps the read forward-safe: a future migration
+  // that widens the domain is reported faithfully, never folded onto `kya`.
+  readonly kind:
+    | "ucp_platform_rfc9421"
+    | "kya"
+    | "kya_owner"
+    | "kya_buyer"
+    | "boson_seller_offer"
+    | "x402_buyer_erc3009"
+    | "autonomous_delegation"
+    | (string & {});
+  readonly verification: "verified" | "attested";
+  readonly subject_ref: string | null;
+  readonly profile_origin: string | null;
+  readonly artifact: string | null;
+  readonly artifact_input: string | null;
+  readonly content_digest: string | null;
+  readonly artifact_sha256: string | null;
+  readonly recorded_at: string;
+}
+
+export interface GetSignaturesResponse {
+  readonly order_id: string;
+  readonly signatures: readonly OrderSignatureRecord[];
+  readonly authorizations: readonly OrderAuthorizationRecord[];
+}
+
 export interface OrderHistoryRequest {
   readonly since?: string; // ISO 8601
   readonly limit?: number;
@@ -1046,6 +1189,14 @@ export interface Refund {
   /** The derived partial amount in cents, persisted at approval; null until a
    *  partial is approved (and always null for a full-order refund). */
   readonly amount_minor?: number | null;
+  /** Boson W2 resolveDispute split, present once a partial on a Boson escrow
+   *  order is approved: the seller's offered EIP-712 Resolution half, the
+   *  server-derived split in basis points, and the on-chain exchange the split
+   *  resolves. The order's buyer reads these to co-sign + submit the resolveDispute.
+   *  Absent/null otherwise. */
+  readonly seller_resolution_signature?: string | null;
+  readonly buyer_percent_bps?: number | null;
+  readonly boson_exchange_id?: string | null;
 }
 
 export interface RefundRequestRequest {
@@ -1705,6 +1856,92 @@ export interface SubmitProofAttestationResponse {
   readonly proof_kind: ProofKind;
 }
 
+// ── Counterparty attestation (P1/P3/P4) ─────────────────────────────────────
+//
+// A merchant and an agent sign a statement about a settlement Facet already
+// recorded, so the chain entry stops being Facet's word about itself. The
+// signature is verified against a key the counterparty registered first; an
+// attestation Facet could have produced would leave the record no stronger
+// than before.
+
+export type AttestationParty = "merchant" | "agent";
+
+/** What a merchant may say. The negative is first-class: `cannot_fulfil` is a
+ *  signed fact, and is exactly what deterministic dispute resolves on. */
+export type MerchantAttestation = "fulfilled" | "cannot_fulfil";
+
+/** What an agent may say. Neither party can make the other's statement. */
+export type AgentAttestation = "received" | "not_received";
+
+export interface RegisterAttestationKeyRequest {
+  readonly party: AttestationParty;
+  /** Required for `merchant`; the caller must administer it. Ignored for
+   *  `agent`, whose subject is bound from the verified token instead. */
+  readonly site_id?: string;
+  /** Key id the signer will put in the JWS protected header. */
+  readonly kid: string;
+  /** Raw 32-byte Ed25519 public key, base64url, as RFC 8037 publishes in `x`. */
+  readonly public_key: string;
+}
+
+export interface RegisterAttestationKeyResponse {
+  readonly registered: true;
+  readonly party: AttestationParty;
+  /** Who the key speaks for: the agent aid, or the site id for a merchant.
+   *  Always derived from the authenticated principal, never the request. */
+  readonly subject_ref: string;
+  readonly kid: string;
+  readonly status: "active" | "revoked";
+}
+
+export interface RevokeAttestationKeyRequest {
+  readonly party: AttestationParty;
+  /** Required for `merchant`; the caller must administer it. Ignored for
+   *  `agent`, whose subject is bound from the verified token. */
+  readonly site_id?: string;
+  readonly kid: string;
+}
+
+export interface RevokeAttestationKeyResponse {
+  readonly revoked: true;
+  readonly party: AttestationParty;
+  readonly kid: string;
+  /** Attestations signed before this moment remain verifiable. Revocation stops
+   *  future signing; it does not let a party unsay what they already said. */
+  readonly revoked_at: string;
+}
+
+export interface AttestFulfillmentRequest {
+  readonly site_id: string;
+  /** Hex of the chain entry being attested to. Must equal the `this_hash`
+   *  inside the signed payload: the signature decides, not the request. */
+  readonly this_hash: string;
+  /** Compact JWS, `alg: EdDSA`, `typ: facet-attestation+jws`. */
+  readonly jws: string;
+}
+
+export interface AttestReceiptRequest {
+  readonly this_hash: string;
+  readonly jws: string;
+}
+
+export interface AttestationResponse {
+  readonly recorded: true;
+  readonly party: AttestationParty;
+  readonly attestation: MerchantAttestation | AgentAttestation;
+  readonly this_hash: string;
+  /** Which registered key the signature was verified against. Echoed because
+   *  it is the first thing a caller needs when debugging a rejection. */
+  readonly kid: string;
+  /** Always `signed` from these routes. The field exists so a future
+   *  session-authority path would be visibly weaker rather than silently
+   *  counted alongside verified signatures. */
+  readonly strength: "signed";
+  /** True when this party had already attested to this entry; the append is
+   *  idempotent, so a retry is the same fact arriving twice. */
+  readonly idempotent: boolean;
+}
+
 // ── POST /v1/webhooks/calendly ──────────────────────────────────────────────
 //
 // Vendor-relay route — the inbound shape is owned by Calendly. The ack
@@ -1873,4 +2110,101 @@ export interface PromoSlotsResponse {
   readonly tier2_cap: number;
   /** False when the counts are placeholder zeros (no database configured). */
   readonly live: boolean;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// wishlist_add / wishlist_list / wishlist_remove
+//   POST /v1/wishlist_add, /v1/wishlist_list, /v1/wishlist_remove
+//
+// A buyer's persisted wishlist (explicit saved items), owner-scoped to the KYA
+// `aid` claim. Read/write, moves no funds: stores only {site_id, agent_aid,
+// product_id, note, added_at}. `agent_aid` is derived from the authenticated
+// KYA, never from the body, so a caller can only ever read or write its own
+// list. A derived-preference profile inferred from order history is out of
+// scope (a separate opt-in decision).
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface WishlistItem {
+  readonly product_id: string;
+  /** The merchant Terminal this item was saved on. */
+  readonly site_id: string;
+  readonly note: string | null;
+  /** ISO 8601. When the item was first saved. */
+  readonly added_at: string;
+}
+
+export interface WishlistAddRequest {
+  readonly product_id: string;
+  /** Optional buyer note. No PII expected. */
+  readonly note?: string;
+}
+
+export interface WishlistAddResponse {
+  readonly item: WishlistItem;
+  /** False when the product was already on the list (idempotent re-add; the
+   *  note is updated in place and added_at is preserved). */
+  readonly created: boolean;
+}
+
+export interface WishlistListRequest {
+  /** Max items to return (newest first). Defaults + caps applied server-side. */
+  readonly limit?: number;
+}
+
+export interface WishlistListResponse {
+  readonly items: readonly WishlistItem[];
+}
+
+export interface WishlistRemoveRequest {
+  readonly product_id: string;
+}
+
+export interface WishlistRemoveResponse {
+  /** False when nothing matched (idempotent remove). */
+  readonly removed: boolean;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MPP (Machine Payments Protocol, mpp.dev) — POST /mpp/v1/charges
+//
+// The 402 boundary spoken in MPP's challenge / credential / receipt envelope,
+// settled through the SAME non-custodial x402 path as the UCP checkout. These
+// are the only Facet-shaped types on that route: the challenge, the credential
+// and the receipt are the protocol's own, carried on the WWW-Authenticate,
+// Authorization and Payment-Receipt headers respectively, and are produced and
+// parsed by the mppx SDK rather than redefined here. Redefining them is how
+// conformance rots.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface MppChargeRequest {
+  /** The Facet reservation to charge, from POST /v1/reserve or a UCP checkout
+   *  CREATE. The unguessable id is the capability on this route: an unknown one
+   *  returns 404, and settlement runs as the reservation's own agent, never one
+   *  asserted by the request. */
+  readonly reservation_id: string;
+}
+
+export interface MppChargeResponse {
+  readonly status: "settled";
+  readonly order: { readonly id: string };
+  /** Rail-native settlement reference. For evm/charge on Base, the on-chain
+   *  transaction hash. Also carried inside the Payment-Receipt header. */
+  readonly settlement_id: string;
+  readonly settled_at?: string;
+}
+
+/** RFC 9457 problem details for an MPP failure. ALWAYS accompanied by a fresh
+ *  `WWW-Authenticate: Payment ...` challenge: an agent whose credential was
+ *  rejected cannot retry otherwise, because the challenge it was holding may be
+ *  exactly what was wrong with it. */
+export interface MppProblem {
+  /** Stable problem-type URI an agent can branch on, rather than prose. */
+  readonly type: string;
+  readonly title: string;
+  readonly status: 402;
+  readonly detail: string;
+  /** Whether signing a new credential against the fresh challenge can succeed.
+   *  False means something other than the credential must change (a different
+   *  order, a different chain), so a blind retry loop is pointless. */
+  readonly retryable: boolean;
 }

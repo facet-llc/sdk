@@ -51,12 +51,15 @@ export {
 export {
   BOSON_CANCEL_FUNCTION_NAME,
   BOSON_REDEEM_FUNCTION_NAME,
+  BOSON_RESOLVE_DISPUTE_FUNCTION_NAME,
   type RedeemPayloadRejection,
   type RedeemPayloadValidation,
   validateCancelPayload,
   type ValidateCancelPayloadArgs,
   validateRedeemPayload,
   type ValidateRedeemPayloadArgs,
+  validateResolvePayload,
+  type ValidateResolvePayloadArgs,
 } from "./redeem-payload.ts";
 
 // Re-export the Boson SDK store + reader contracts so a host can implement

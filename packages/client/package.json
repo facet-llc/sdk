@@ -1,9 +1,19 @@
 {
   "name": "@facet-llc/client",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "private": false,
   "type": "module",
+  "sideEffects": false,
   "description": "Agent-side client SDK for the Facet Terminal protocol. Handles KYA bearer tokens, structured error envelopes, X-Agent-Trace-Id propagation, X-Facet-RateLimit-* capture, and idempotency-key forwarding. Runs on Node 20+, Bun, and Deno. Native fetch + AbortController.",
+  "keywords": [
+    "facet",
+    "agent-commerce",
+    "x402",
+    "kya",
+    "terminal",
+    "sdk",
+    "openapi"
+  ],
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
@@ -19,7 +29,8 @@
     "dist/",
     "LICENSE",
     "NOTICE",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md"
   ],
   "scripts": {
     "build": "tsup",

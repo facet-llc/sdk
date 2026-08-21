@@ -88,9 +88,18 @@ import {
   type TokenAuthStrategy,
 } from "@bosonprotocol/x402-core/schemes/escrow";
 import type { UnsignedFullOffer } from "@bosonprotocol/x402-core/eip712";
-import { buildOfferMetadata, type BuiltOfferMetadata, type OfferProductInfo } from "./metadata.ts";
+import {
+  buildLineOfferMetadata,
+  buildOfferMetadata,
+  type BuiltOfferMetadata,
+  type OfferProductInfo,
+} from "./metadata.ts";
 import { bindingMismatchNativeCode, isBindingMismatchError } from "./binding-error.ts";
-import { validateCancelPayload, validateDisputePayload } from "./redeem-payload.ts";
+import {
+  validateCancelPayload,
+  validateDisputePayload,
+  validateRevokePayload,
+} from "./redeem-payload.ts";
 
 const PACKAGE_VERSION = "0.1.0";
 
@@ -331,6 +340,17 @@ export class BosonEscrowAdapter implements FacetPaymentRailAdapter {
       );
     }
 
+    // Per-line mode (S2): authority.lines present. Gate + validate each line's
+    // own X-PAYMENT against its own seller-signed requirements, bind the lines to
+    // the cart total, and encode a per-line handle. Absent -> legacy single below.
+    if (Array.isArray(input.authority["lines"])) {
+      return await this.verifyPerLine(
+        cfg.value,
+        input.authority["lines"] as unknown[],
+        input.amount.amount,
+      );
+    }
+
     const xPayment = readString(input.authority, "x_payment");
     if (xPayment === null) {
       return errResult(
@@ -398,10 +418,32 @@ export class BosonEscrowAdapter implements FacetPaymentRailAdapter {
     // commit creates it). The host server stores this opaque handle on the
     // order row and re-presents it at reserve time.
     const handle = encodeHandle({ x_payment: xPayment, requirements });
+    // Surface the commit signer as `payer` so the Terminal can bind a
+    // wallet-anchored buyer KYA to the committing wallet (mirrors the x402
+    // adapter surfacing the ERC-3009 `authorization.from` after the
+    // facilitator verify). This is sound precisely because
+    // validatePaymentPayload has already returned ok above: its rule 8
+    // (BAD_META_TX_SIGNATURE) recovers the commit meta-tx signer via EIP-712
+    // (`recoverMetaTransactionSigner`) and asserts
+    // `recovered == payload.buyer == metaTx.from`, so
+    // `decoded.payload.payload.buyer` is the CRYPTOGRAPHICALLY RECOVERED
+    // signer, not a claimed field. The binding target is deliberately the
+    // commit signer (the party that controls the resulting exchange: redeem,
+    // dispute, refund), not the wallet whose USDC ultimately moves. For every
+    // strategy other than "none" the ERC-3009 token authorization rides a
+    // separate, self-signed meta-tx (executeMetaTransactionWithTokenTransfer
+    // Authorization), so its `from` is NOT covered by this commit signature
+    // and is not what we bind. Binding the committer is still sound: attaching
+    // a wallet-anchored KYA requires the committer's own meta-tx key, which
+    // rule 8 has just proven, and a victim's USDC cannot move without the
+    // victim's own ERC-3009 signature on-chain. When a buyer-KYA wallet
+    // binding is required, the Terminal now has a recovered payer to bind
+    // against instead of failing closed.
     return {
       kind: "ok",
       value: {
         authority_handle: handle,
+        payer: decoded.payload.payload.buyer,
         expires_at: new Date(
           (Math.floor(this.now() / 1000) + requirements.maxTimeoutSeconds) * 1000,
         ).toISOString(),
@@ -669,6 +711,13 @@ export class BosonEscrowAdapter implements FacetPaymentRailAdapter {
       );
     }
 
+    // Per-line mode (S2): the handle carries N lines. Commit each line's own
+    // exchange CONCURRENTLY; a partial commit still records its successes, and
+    // the Terminal re-verifies only the uncommitted lines on retry.
+    if (isPerLineHandle(handle)) {
+      return await this.reservePerLine(cfg.value, handle);
+    }
+
     const built = this.buildServer(cfg.value);
     if (built.kind === "error") return built.error;
 
@@ -714,6 +763,371 @@ export class BosonEscrowAdapter implements FacetPaymentRailAdapter {
         result.body.nextActions,
         result.body.txHash,
       ),
+    };
+  }
+
+  // ─── per-line (S2, behind FACET_BOSON_PER_LINE_ESCROW) ────────────────────────
+
+  /** Per-line quote: build N seller-signed offers, one per cart line at that
+   *  line's priced amount, returned as `{ per_line, lines: [{line_index,
+   *  requirements}] }` for the buyer to sign N X-PAYMENTs against. Each offer is
+   *  seller-signed, so a buyer cannot reprice a line; the per-line amounts MUST
+   *  sum to the cart total, which binds the lines to the quote. */
+  private async quotePerLine(
+    cfg: BosonMerchantConfig,
+    server: X402bServer,
+    lines: QuoteLineItem[],
+    opts: QuoteOptions,
+    cartTotal: number,
+  ): Promise<RailAdapterResult<BuildRequirementsOk>> {
+    let sum = 0n;
+    for (const it of lines) sum += lineAmountAtomic(it);
+    if (sum !== BigInt(cartTotal)) {
+      return errResult(
+        "INVALID_REQUEST",
+        `line_items total (${sum.toString()}) does not equal amount.amount (${cartTotal})`,
+      );
+    }
+
+    const nowMs = this.now();
+    let built: Array<{
+      readonly line_index: number;
+      readonly requirements: EscrowPaymentRequirements;
+      readonly metadata: BuiltOfferMetadata;
+    }>;
+    try {
+      built = await Promise.all(
+        lines.map(async (it) => {
+          const lineAtomic = lineAmountAtomic(it).toString();
+          const metadata = buildLineOfferMetadata(
+            { product: it.product, lineNonce: it.lineNonce },
+            {
+              exchangeToken: cfg.asset,
+              network: cfg.network,
+              metadataBaseUri: opts.metadataBaseUri,
+            },
+          );
+          const unsigned = buildUnsignedOffer(cfg, lineAtomic, opts, nowMs, metadata);
+          const requirements = stampServerChannel(
+            await server.buildPaymentRequirements({
+              offer: { unsigned },
+              asset: cfg.asset,
+              amount: lineAtomic,
+              tokenAuthStrategies: opts.tokenAuthStrategies,
+              recipientId: cfg.sellerId,
+              maxTimeoutSeconds: opts.maxTimeoutSeconds,
+            }),
+          );
+          return { line_index: it.lineIndex, requirements, metadata };
+        }),
+      );
+    } catch (e) {
+      return makeError(
+        "INTERNAL_ERROR",
+        `Boson per-line buildPaymentRequirements failed: ${asMessage(e)}`,
+        false,
+        null,
+      );
+    }
+
+    const expiresAt = new Date(
+      (Math.floor(nowMs / 1000) + opts.maxTimeoutSeconds) * 1000,
+    ).toISOString();
+    return {
+      kind: "ok",
+      value: {
+        requirements: {
+          per_line: true,
+          lines: built.map((b) => ({ line_index: b.line_index, requirements: b.requirements })),
+        } as unknown as Readonly<Record<string, unknown>>,
+        expires_at: expiresAt,
+        rail_metadata: {
+          per_line: true,
+          line_count: built.length,
+          lines: built.map((b) => ({
+            line_index: b.line_index,
+            // The sealed per-line amount (equals the seller-signed offer price by
+            // construction here), so the Terminal captures/persists each line at the
+            // quote-sealed value rather than re-deriving it from the buyer's echo or
+            // the escrow's own on-chain price.
+            amount: b.requirements.amount,
+            metadata_uri: b.metadata.metadataUri,
+            metadata_hash: b.metadata.metadataHash,
+          })),
+          max_timeout_seconds: opts.maxTimeoutSeconds,
+          redeem_policy: opts.redeemPolicy,
+        },
+      },
+    };
+  }
+
+  /** Per-line verify: gate + validate each line's own X-PAYMENT against its own
+   *  seller-signed requirements, assert one buyer across all lines and that the
+   *  per-line amounts sum to the cart total, then encode a per-line handle. */
+  private async verifyPerLine(
+    cfg: BosonMerchantConfig,
+    authLines: unknown[],
+    cartTotal: number,
+  ): Promise<RailAdapterResult<VerifyAuthorityOk>> {
+    if (authLines.length === 0) {
+      return errResult("INVALID_REQUEST", "authority.lines must be a non-empty array");
+    }
+    const lines: BosonLineHandle[] = [];
+    const seen = new Set<number>();
+    let sum = 0n;
+    let payer: string | undefined;
+    let maxTimeoutSeconds = 0;
+    for (let i = 0; i < authLines.length; i++) {
+      const el = authLines[i];
+      if (!isRecord(el)) {
+        return errResult("INVALID_REQUEST", `authority.lines[${i}] must be an object`);
+      }
+      const li = el["line_index"];
+      if (typeof li !== "number" || !Number.isInteger(li) || li < 0) {
+        return errResult(
+          "INVALID_REQUEST",
+          `authority.lines[${i}].line_index must be a non-negative integer`,
+        );
+      }
+      if (seen.has(li)) {
+        return errResult("INVALID_REQUEST", `authority.lines has a duplicate line_index ${li}`);
+      }
+      seen.add(li);
+      const xPayment = readString(el, "x_payment");
+      if (xPayment === null) {
+        return errResult("INVALID_REQUEST", `authority.lines[${i}].x_payment is required`);
+      }
+      let requirements: EscrowPaymentRequirements;
+      try {
+        requirements = parseEscrowPaymentRequirements(el["requirements"]);
+      } catch (e) {
+        return errResult(
+          "INVALID_REQUEST",
+          `authority.lines[${i}].requirements failed Boson escrow schema validation: ${asMessage(e)}`,
+        );
+      }
+      // The seller signature covers offer.fullOffer (which carries the escrowed
+      // `price`), NOT the sibling requirements.amount, so a buyer can echo a
+      // genuinely seller-signed offer under an inflated `amount`. Read the per-line
+      // value from the SIGNED price and bind the label to it (reject a diverging
+      // label loudly), so the cart-total invariant below binds to what is actually
+      // escrowed on-chain rather than a free-floating number the buyer controls.
+      // Without this, a $1 seller-signed offer presented as amount:"$100" would pass
+      // the gate (self-consistently) and sum to a $100 cart while $1 sits in escrow.
+      const signedPrice = offerSignedPrice(requirements);
+      if (signedPrice === null) {
+        return errResult(
+          "INVALID_REQUEST",
+          `authority.lines[${i}].requirements.offer.fullOffer.price is missing or not a uint string`,
+        );
+      }
+      if (BigInt(requirements.amount) !== BigInt(signedPrice)) {
+        return errResult(
+          "INVALID_REQUEST",
+          `authority.lines[${i}].requirements.amount (${requirements.amount}) does not match the ` +
+            `seller-signed offer price (${signedPrice})`,
+        );
+      }
+      // Gate on the SIGNED price (creator/escrow/asset/network/sellerId + amount),
+      // so the gate's amount check binds to the signed value, not to itself.
+      const gate = gateRequirements(requirements, cfg, Number(signedPrice));
+      if (gate !== null) return gate;
+      sum += BigInt(signedPrice);
+      maxTimeoutSeconds = Math.max(maxTimeoutSeconds, requirements.maxTimeoutSeconds);
+
+      const decoded = decodeXPaymentHeader(xPayment);
+      if (!decoded.ok) {
+        return errResult(
+          "INVALID_REQUEST",
+          `authority.lines[${i}] X-PAYMENT decode failed (${decoded.code}): ${decoded.reason}`,
+        );
+      }
+      if (decoded.payload.payload.action !== FLOW_A_COMMIT_ACTION) {
+        return errResult(
+          "INVALID_REQUEST",
+          `authority.lines[${i}]: only ${FLOW_A_COMMIT_ACTION} (two-step escrow) is accepted`,
+        );
+      }
+      const validation = await validatePaymentPayload({
+        payload: decoded.payload,
+        requirements,
+        chainId: cfg.chainId,
+        now: Math.floor(this.now() / 1000),
+      });
+      if (!validation.ok) {
+        return makeError(
+          "UNAUTHORIZED",
+          `authority.lines[${i}] X-PAYMENT failed Boson validation rule ${validation.rule} (${validation.code})`,
+          false,
+          validation.code,
+        );
+      }
+      // Every line of one cart must be committed by the SAME buyer wallet (the
+      // cryptographically recovered commit signer, per verifyAuthority's rule-8
+      // note), so one buyer's per-line cancel/refund authority covers the cart.
+      const linePayer = decoded.payload.payload.buyer;
+      if (payer === undefined) payer = linePayer;
+      else if (!eqAddress(payer, linePayer)) {
+        return errResult(
+          "INVALID_REQUEST",
+          `authority.lines[${i}] is committed by a different buyer than its sibling lines`,
+        );
+      }
+      lines.push({ line_index: li, x_payment: xPayment, requirements });
+    }
+    if (sum !== BigInt(cartTotal)) {
+      return errResult(
+        "INVALID_REQUEST",
+        `per-line amounts (${sum.toString()}) do not sum to amount.amount (${cartTotal})`,
+      );
+    }
+    const handle = encodeHandle({ lines });
+    const expiresAt =
+      maxTimeoutSeconds > 0
+        ? new Date((Math.floor(this.now() / 1000) + maxTimeoutSeconds) * 1000).toISOString()
+        : null;
+    return {
+      kind: "ok",
+      value: {
+        authority_handle: handle,
+        expires_at: expiresAt,
+        ...(payer !== undefined ? { payer } : {}),
+      },
+    };
+  }
+
+  /** Per-line reserve: commit each line's own exchange CONCURRENTLY. Uses
+   *  Promise.allSettled so a partial commit still records the lines that landed;
+   *  reservation_active is true only when ALL lines committed. Per-line results
+   *  ride rail_metadata.escrow_lines so the Terminal upserts one
+   *  boson_exchange_lines row per committed line, and re-verifies only the
+   *  uncommitted lines on retry. A same-call post-settle race (the commit landed
+   *  but the SDK read it before it mined) is recovered per line via
+   *  reverifyExchangeState, mirroring the single-voucher path. */
+  private async reservePerLine(
+    cfg: BosonMerchantConfig,
+    handle: BosonPerLineHandle,
+  ): Promise<RailAdapterResult<ReserveAuthorityOk>> {
+    const built = this.buildServer(cfg);
+    if (built.kind === "error") return built.error;
+    const server = built.server;
+
+    // Commit every line concurrently. Catch INSIDE the map so a throwing line
+    // still resolves to a tagged result that keeps its own `ln` (Promise.all over
+    // never-rejecting promises is equivalent to allSettled here, and keeps the
+    // line identity a rejected result would lose).
+    const results = await Promise.all(
+      handle.lines.map(async (ln) => {
+        // Defense-in-depth: the handle is adapter-encoded (unauthenticated) and
+        // server-stored between verify and reserve. Re-bind each line's amount to its
+        // seller-signed price and re-run the seller/escrow/amount gate before the
+        // commit, so reserve does not lean on the handle's integrity to carry the
+        // verify-time guarantees onto the money move. A line that fails here is
+        // recorded failed, never committed, and never affects its siblings.
+        const signedPrice = offerSignedPrice(ln.requirements);
+        if (signedPrice === null || BigInt(ln.requirements.amount) !== BigInt(signedPrice)) {
+          return {
+            ln,
+            result: undefined,
+            thrown: "line amount is not bound to the seller-signed offer price",
+          };
+        }
+        if (gateRequirements(ln.requirements, cfg, Number(signedPrice)) !== null) {
+          return {
+            ln,
+            result: undefined,
+            thrown: "line requirements failed the seller/escrow/amount gate at reserve",
+          };
+        }
+        try {
+          const result = await server.handlers.commit({
+            paymentHeader: ln.x_payment,
+            requirements: ln.requirements,
+          });
+          return { ln, result, thrown: undefined as string | undefined };
+        } catch (e) {
+          return { ln, result: undefined, thrown: asMessage(e) };
+        }
+      }),
+    );
+
+    const escrowLines: Array<Readonly<Record<string, unknown>>> = [];
+    let committedCount = 0;
+    for (const { ln, result, thrown } of results) {
+      if (result === undefined) {
+        escrowLines.push({
+          line_index: ln.line_index,
+          amount: ln.requirements.amount,
+          status: "failed",
+          reason: thrown ?? "Boson commit failed",
+          retryable: true,
+        });
+        continue;
+      }
+      if (result.ok) {
+        escrowLines.push({
+          line_index: ln.line_index,
+          amount: ln.requirements.amount,
+          status: "committed",
+          ...escrowStateView(result.body.nextActions),
+          tx_hash: result.body.txHash,
+        });
+        committedCount++;
+        continue;
+      }
+      // Not ok: the commit may still have landed. Re-verify COMMITTED against the
+      // chain before declaring this line failed (the same-call post-settle race),
+      // keyed on THIS line's own exchange id, never a sibling's.
+      const exId = (result.body.details as Record<string, unknown> | undefined)?.exchangeId;
+      const recovered =
+        typeof exId === "string"
+          ? await this.reverifyExchangeState(cfg, exId, "COMMITTED", result)
+          : null;
+      if (recovered !== null) {
+        const rm = recovered.rail_metadata as {
+          readonly escrow_state?: Readonly<Record<string, unknown>>;
+          readonly tx_hash?: string;
+        };
+        escrowLines.push({
+          line_index: ln.line_index,
+          amount: ln.requirements.amount,
+          status: "committed",
+          ...(rm.escrow_state ?? {}),
+          tx_hash: rm.tx_hash ?? "",
+        });
+        committedCount++;
+      } else {
+        escrowLines.push({
+          line_index: ln.line_index,
+          amount: ln.requirements.amount,
+          status: "failed",
+          reason: `${result.body.code}: ${result.body.reason}`,
+          retryable: result.status >= 500,
+        });
+      }
+    }
+
+    const first = handle.lines[0];
+    const reservedUntil =
+      first !== undefined && first.requirements.maxTimeoutSeconds > 0
+        ? new Date(this.now() + first.requirements.maxTimeoutSeconds * 1000).toISOString()
+        : null;
+    return {
+      kind: "ok",
+      value: {
+        // A partial commit is a valid mid-state, not an error: the Terminal
+        // persists the committed lines and re-verifies only the uncommitted ones
+        // on retry (no atomic multi-commit exists). reservation_active is true
+        // only when the whole cart committed.
+        reservation_active: committedCount === handle.lines.length,
+        reserved_until: reservedUntil,
+        rail_metadata: {
+          per_line: true,
+          line_count: handle.lines.length,
+          committed_count: committedCount,
+          escrow_lines: escrowLines,
+        },
+      },
     };
   }
 
@@ -841,24 +1255,53 @@ export class BosonEscrowAdapter implements FacetPaymentRailAdapter {
 
     const exchangeId = input.settlement_id;
 
-    // The buyer's pre-signed boson-cancelVoucher meta-tx rides in `authority`
-    // (a cancel can only be signed by the voucher holder). Seller-initiated
-    // revoke is a separate, founder-gated leg not wired here (v1 = buyer-cancel).
+    // A pre-redeem Boson refund has TWO possible signers, and which one applies is
+    // the caller's declaration, never a guess from the payload's contents.
+    //
+    //   cancel (default): BUYER-signed `boson-cancelVoucher`. Only the voucher
+    //     holder can sign it, so the chain itself is the authorization.
+    //   revoke: SELLER-signed `boson-revokeVoucher`, the merchant cancelling a
+    //     committed order before fulfillment. Same refund outcome for the buyer,
+    //     different signer and a different EIP-712 struct.
+    //
+    // Sniffing the function out of the payload instead would let a BUYER-signed
+    // cancel ride the seller path and skip the assistant-address gate the caller
+    // applies to a revoke. So the caller declares intent and the matching
+    // validator enforces it: a mismatch is refused as not_a_cancel/not_a_revoke.
+    const declared = readString(input.authority ?? null, "action") ?? "cancel";
+    if (declared !== "cancel" && declared !== "revoke") {
+      return errResult(
+        "INVALID_REQUEST",
+        `Boson refund authority.action must be "cancel" or "revoke", got "${declared}".`,
+      );
+    }
+    const isRevoke = declared === "revoke";
     const signedPayload = readHex(input.authority ?? null, "signed_payload");
     if (signedPayload === null) {
       return errResult(
         "INVALID_REQUEST",
-        "Boson refund requires authority.signed_payload (the buyer-signed boson-cancelVoucher meta-tx)",
+        `Boson refund requires authority.signed_payload (the ${
+          isRevoke ? "seller-signed boson-revokeVoucher" : "buyer-signed boson-cancelVoucher"
+        } meta-tx)`,
       );
     }
 
-    // 1) INTEGRITY (offline): a well-formed cancelVoucher for EXACTLY this exchange.
-    const valid = await validateCancelPayload({
-      signedPayload,
-      exchangeId,
-      chainId: cfg.value.chainId,
-      verifyingContract: cfg.value.escrow,
-    });
+    // 1) INTEGRITY (offline): a well-formed cancel/revoke for EXACTLY this exchange.
+    //    Both are self-binding over the exchange id, so a payload can only ever act
+    //    on the exchange it was signed for.
+    const valid = isRevoke
+      ? await validateRevokePayload({
+          signedPayload,
+          exchangeId,
+          chainId: cfg.value.chainId,
+          verifyingContract: cfg.value.escrow,
+        })
+      : await validateCancelPayload({
+          signedPayload,
+          exchangeId,
+          chainId: cfg.value.chainId,
+          verifyingContract: cfg.value.escrow,
+        });
     if (!valid.ok) {
       return errResult(
         "INVALID_REQUEST",
@@ -893,7 +1336,7 @@ export class BosonEscrowAdapter implements FacetPaymentRailAdapter {
         network: cfg.value.network,
         escrowAddress: cfg.value.escrow,
         exchangeId,
-        action: "boson-cancelVoucher",
+        action: isRevoke ? "boson-revokeVoucher" : "boson-cancelVoucher",
         signedPayload,
       });
     } catch (e) {
@@ -917,10 +1360,15 @@ export class BosonEscrowAdapter implements FacetPaymentRailAdapter {
       );
     }
 
+    // The facilitator reports the post-transition state. Fall back to the terminal
+    // state the action produces: a seller revoke lands on REVOKED, a buyer cancel on
+    // CANCELLED. Both refund the buyer, and confirmExchangeRefunded accepts either.
     const newExchangeState =
       "newExchangeState" in relay && typeof relay.newExchangeState === "string"
         ? relay.newExchangeState
-        : "CANCELLED";
+        : isRevoke
+          ? "REVOKED"
+          : "CANCELLED";
     return {
       kind: "ok",
       value: {
@@ -1081,6 +1529,15 @@ export class BosonEscrowAdapter implements FacetPaymentRailAdapter {
     const built = this.buildServer(cfg.value);
     if (built.kind === "error") return built.error;
 
+    // Per-line mode (S2): when options.line_items is present, build ONE offer
+    // per line at that line's priced amount instead of one at the cart total.
+    // Absent -> the legacy single-voucher path below runs byte-identically.
+    const lineItems = readLineItems(input.options, input.ctx.idempotency_key);
+    if (lineItems !== null && !Array.isArray(lineItems)) return lineItems; // malformed
+    if (Array.isArray(lineItems)) {
+      return await this.quotePerLine(cfg.value, built.server, lineItems, opts, input.amount.amount);
+    }
+
     const nowMs = this.now();
     const amountAtomic = String(input.amount.amount);
 
@@ -1117,29 +1574,10 @@ export class BosonEscrowAdapter implements FacetPaymentRailAdapter {
       );
     }
 
-    // Advertise the "server" channel on each commit action so the x402-client's
-    // pickAction resolves — it requires the commit action on the "server"
-    // channel, but the Boson SDK's deriveNextActions only emits
-    // facilitator/onchain. These channels are UNSIGNED advertising metadata (the
-    // seller signs only the FullOffer — see boson-seller-signer.ts), so stamping
-    // here is signature-safe. Buyers submit the X-PAYMENT to the host server's
-    // /v1/payments/dispatch (the server channel); facilitator/onchain stay as
-    // direct fallbacks.
-    if (requirements.actions?.next !== undefined) {
-      requirements = {
-        ...requirements,
-        actions: {
-          ...requirements.actions,
-          next: requirements.actions.next.map((a) => ({
-            ...a,
-            channels: a.channels.includes("server")
-              ? a.channels
-              : (["server", ...a.channels] as typeof a.channels),
-            endpoints: { ...(a.endpoints ?? {}), server: "/v1/payments/dispatch" },
-          })),
-        },
-      } as EscrowPaymentRequirements;
-    }
+    // Advertise the "server" channel so the x402-client's pickAction resolves
+    // (buyers submit the X-PAYMENT to the host server's /v1/payments/dispatch;
+    // facilitator/onchain stay as direct fallbacks). Shared with the per-line path.
+    requirements = stampServerChannel(requirements);
 
     // Quote expiry = the token-auth deadline horizon (the buyer's commit
     // authorization is bounded by maxTimeoutSeconds). The commit must land
@@ -1775,6 +2213,124 @@ function buildUnsignedOffer(
   } satisfies UnsignedFullOffer;
 }
 
+// ─── per-line quote/verify helpers (S2, behind FACET_BOSON_PER_LINE_ESCROW) ────
+
+/** One cart line parsed from options.line_items at quote time. */
+interface QuoteLineItem {
+  readonly lineIndex: number;
+  readonly qty: number;
+  /** Atomic USDC decimal string (unit price; the line total is qty times this). */
+  readonly unitPriceAtomic: string;
+  readonly product: OfferProductInfo | undefined;
+  /** Deterministic, cart-unique, quote-stable offerNonce for this line. */
+  readonly lineNonce: string;
+}
+
+/** Parse options.line_items into typed per-line quote inputs. Returns null when
+ *  the key is absent (the legacy single-voucher path stays byte-identical), an
+ *  error result when present but malformed (a caller that sent line_items
+ *  intended per-line), or the parsed items. `quoteSeed` seeds a derived per-line
+ *  nonce when a line omits its own. */
+function readLineItems(
+  o: Readonly<Record<string, unknown>> | undefined,
+  quoteSeed: string,
+): QuoteLineItem[] | RailAdapterResult<never> | null {
+  const raw = o?.["line_items"];
+  if (raw === undefined) return null;
+  if (!Array.isArray(raw) || raw.length === 0) {
+    return errResult(
+      "INVALID_REQUEST",
+      "options.line_items, when present, must be a non-empty array",
+    );
+  }
+  const items: QuoteLineItem[] = [];
+  const seen = new Set<number>();
+  for (let i = 0; i < raw.length; i++) {
+    const el = raw[i];
+    if (!isRecord(el)) return errResult("INVALID_REQUEST", `line_items[${i}] must be an object`);
+    const li = el["line_index"];
+    if (typeof li !== "number" || !Number.isInteger(li) || li < 0) {
+      return errResult(
+        "INVALID_REQUEST",
+        `line_items[${i}].line_index must be a non-negative integer`,
+      );
+    }
+    if (seen.has(li)) {
+      return errResult("INVALID_REQUEST", `line_items has a duplicate line_index ${li}`);
+    }
+    seen.add(li);
+    const qty = el["qty"];
+    if (typeof qty !== "number" || !Number.isInteger(qty) || qty <= 0) {
+      return errResult("INVALID_REQUEST", `line_items[${i}].qty must be a positive integer`);
+    }
+    const upa = el["unit_price_atomic"];
+    if (typeof upa !== "string" || !/^[0-9]+$/.test(upa) || upa === "0") {
+      return errResult(
+        "INVALID_REQUEST",
+        `line_items[${i}].unit_price_atomic must be a positive atomic-unit string`,
+      );
+    }
+    const nonce = el["nonce"];
+    const lineNonce = typeof nonce === "string" && nonce !== "" ? nonce : `${quoteSeed}:${li}`;
+    items.push({
+      lineIndex: li,
+      qty,
+      unitPriceAtomic: upa,
+      product: readProductInfo(el["product"]),
+      lineNonce,
+    });
+  }
+  return items;
+}
+
+/** A line total in atomic units: qty times unit_price_atomic, as a BigInt so a
+ *  large USDC uint256 never overflows. */
+function lineAmountAtomic(it: QuoteLineItem): bigint {
+  return BigInt(it.unitPriceAtomic) * BigInt(it.qty);
+}
+
+/** The seller-signed escrowed price for a line: `requirements.offer.fullOffer.price`.
+ *  The seller signature covers `fullOffer`, so this is the value ACTUALLY escrowed
+ *  on-chain (assertExchangeBinding compares a redeem against this exact field). The
+ *  sibling `requirements.amount` is NOT covered by the signature, so a buyer can echo
+ *  a genuinely seller-signed offer under an inflated `amount`; the per-line value
+ *  must therefore be read from here, never from the label. Returns a canonical uint
+ *  string, or null when the price is absent or not a non-negative integer. */
+function offerSignedPrice(requirements: EscrowPaymentRequirements): string | null {
+  const raw = (requirements.offer.fullOffer as Record<string, unknown>)["price"];
+  if (typeof raw === "string" && /^[0-9]+$/.test(raw)) return raw;
+  // isSafeInteger, NOT isInteger: fullOffer is z.record(z.unknown()), so a hostile
+  // buyer can echo a numeric price like 1e21. String(1e21) is "1e+21", which BigInt
+  // rejects with a throw, and the callers BigInt() this value BEFORE any surrounding
+  // catch, so an unsafe-integer double must fall through to the null rejection rather
+  // than stringify to exponential notation.
+  if (typeof raw === "number" && Number.isSafeInteger(raw) && raw >= 0) return String(raw);
+  return null;
+}
+
+/** Advertise the "server" channel on each commit action so the x402-client's
+ *  pickAction resolves (it requires the commit action on the "server" channel,
+ *  but the Boson SDK's deriveNextActions emits only facilitator/onchain). These
+ *  channels are UNSIGNED advertising metadata (the seller signs only the
+ *  FullOffer), so stamping here is signature-safe. Shared by the single-voucher
+ *  and per-line quote paths. */
+function stampServerChannel(requirements: EscrowPaymentRequirements): EscrowPaymentRequirements {
+  if (requirements.actions?.next === undefined) return requirements;
+  return {
+    ...requirements,
+    actions: {
+      ...requirements.actions,
+      next: requirements.actions.next.map((a) => ({
+        ...a,
+        channels: a.channels.includes("server")
+          ? a.channels
+          : (["server", ...a.channels] as typeof a.channels),
+        endpoints: { ...(a.endpoints ?? {}), server: "/v1/payments/dispatch" },
+      })),
+    },
+  } as EscrowPaymentRequirements;
+}
+
 type DisputeKind = "raise" | "resolve" | "retract" | "escalate";
 
 function resolveDisputeKind(input: DisputeInput): DisputeKind {
@@ -2084,18 +2640,38 @@ function asMessage(e: unknown): string {
 
 // ─── opaque authority handle (commit header + requirements) ───────────────────
 
-interface BosonAuthorityHandle {
+interface BosonSingleHandle {
   readonly x_payment: string;
   readonly requirements: EscrowPaymentRequirements;
+}
+
+/** One committed line inside a per-line handle (S2, behind
+ *  FACET_BOSON_PER_LINE_ESCROW): the buyer's X-PAYMENT for that line's own
+ *  seller-signed offer, tagged with the line index. */
+interface BosonLineHandle {
+  readonly line_index: number;
+  readonly x_payment: string;
+  readonly requirements: EscrowPaymentRequirements;
+}
+
+/** A per-line cart handle: N per-line offers plus the buyer's N X-PAYMENTs, which
+ *  reserveAuthority commits concurrently (one Boson exchange per line). */
+interface BosonPerLineHandle {
+  readonly lines: readonly BosonLineHandle[];
+}
+
+type BosonAuthorityHandle = BosonSingleHandle | BosonPerLineHandle;
+
+function isPerLineHandle(h: BosonAuthorityHandle): h is BosonPerLineHandle {
+  return "lines" in h;
 }
 
 const HANDLE_PREFIX = "bosonv1:";
 
 function encodeHandle(h: BosonAuthorityHandle): string {
-  // btoa over UTF-8-escaped JSON — the handle is opaque to the host server,
-  // which stores it on the order row and re-presents it at reserve time.
-  // btoa/atob are available across the adapter's runtimes (Deno,
-  // Node/vitest tests).
+  // btoa over UTF-8-escaped JSON. The handle is opaque to the host server, which
+  // stores it on the order row and re-presents it at reserve time. btoa/atob are
+  // available across the adapter's runtimes (Deno, Node/vitest tests).
   return HANDLE_PREFIX + btoa(unescape(encodeURIComponent(JSON.stringify(h))));
 }
 
@@ -2105,6 +2681,21 @@ function decodeHandle(handle: string): BosonAuthorityHandle | null {
     const json = decodeURIComponent(escape(atob(handle.slice(HANDLE_PREFIX.length))));
     const parsed = JSON.parse(json) as unknown;
     if (!isRecord(parsed)) return null;
+    // Per-line handle: a `lines` array of {line_index, x_payment, requirements}.
+    if (Array.isArray(parsed["lines"])) {
+      const lines: BosonLineHandle[] = [];
+      for (const el of parsed["lines"] as unknown[]) {
+        if (!isRecord(el)) return null;
+        const lineIndex = typeof el["line_index"] === "number" ? el["line_index"] : null;
+        const xp = typeof el["x_payment"] === "string" ? (el["x_payment"] as string) : null;
+        if (lineIndex === null || xp === null) return null;
+        const requirements = parseEscrowPaymentRequirements(el["requirements"]);
+        lines.push({ line_index: lineIndex, x_payment: xp, requirements });
+      }
+      if (lines.length === 0) return null;
+      return { lines };
+    }
+    // Legacy single-voucher handle (flag off).
     const xPayment =
       typeof parsed["x_payment"] === "string" ? (parsed["x_payment"] as string) : null;
     if (xPayment === null) return null;

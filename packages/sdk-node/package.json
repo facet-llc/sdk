@@ -1,10 +1,20 @@
 {
   "name": "@facet-llc/sdk-node",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "private": false,
   "type": "module",
+  "sideEffects": false,
   "description": "Agent-side discovery SDK for the Facet protocol (Node 20+). One-call entry point: discoverAndConnect(\"merchant.com\") fetches /.well-known/agents.txt, validates the v1.2 manifest, and returns a configured Facet Terminal client.",
   "license": "Apache-2.0",
+  "keywords": [
+    "facet",
+    "agent-commerce",
+    "discovery",
+    "agents-txt",
+    "x402",
+    "kya",
+    "sdk"
+  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/facet-llc/sdk.git",
@@ -18,7 +28,8 @@
   "files": [
     "dist/",
     "LICENSE",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md"
   ],
   "scripts": {
     "build": "tsup",

@@ -462,7 +462,7 @@ describe("FacetClient Phase 2 commerce", () => {
       jsonResponse(409, {
         error: {
           code: "IDEMPOTENCY_CONFLICT",
-          message: "Order xyz is 'refunded' — only settled orders can be refunded.",
+          message: "Order xyz is 'refunded'; only settled orders can be refunded.",
           retryable: false,
           retry_after_seconds: null,
           suggest: null,

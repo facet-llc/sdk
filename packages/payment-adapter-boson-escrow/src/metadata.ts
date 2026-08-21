@@ -148,6 +148,33 @@ export function buildOfferMetadata(input: BuildOfferMetadataInput): BuiltOfferMe
   return { metadata, canonicalJson, metadataHash, metadataUri };
 }
 
+/** Per-line offer info for a per-line Boson cart (S2, behind FACET_BOSON_PER_LINE_ESCROW). */
+export interface OfferLineInfo {
+  /** THIS line's product facts (the line's own SKU), threaded as the offer product. */
+  readonly product: OfferProductInfo | undefined;
+  /** A deterministic, cart-unique, quote-stable discriminator for this line,
+   *  supplied by the caller (for example `${checkoutId}:${lineIndex}`). It becomes
+   *  the offer's `offerNonce`, so a retry of an uncommitted line rebuilds a
+   *  byte-identical offer (idempotent) while two lines, even the same SKU twice,
+   *  never collapse into one single-quantity offer (which would revert
+   *  OfferSoldOut on the second commit). MUST be deterministic: never
+   *  crypto.randomUUID(). Derive it from quote-stable coordinates known before the
+   *  order row exists, not from the exchange id or the order id. */
+  readonly lineNonce: string;
+}
+
+/** Build the BPIP-1 BASE metadata for ONE cart line. A thin, deterministic wrapper
+ *  over buildOfferMetadata: it threads the line's own product facts and uses the
+ *  caller's quote-stable per-line nonce, so a cart of N lines produces N distinct
+ *  but reproducible offers. The per-line price is set by the caller on the offer
+ *  (buildUnsignedOffer price), never inside this document. */
+export function buildLineOfferMetadata(
+  line: OfferLineInfo,
+  common: Omit<BuildOfferMetadataInput, "product" | "nonce">,
+): BuiltOfferMetadata {
+  return buildOfferMetadata({ ...common, product: line.product, nonce: line.lineNonce });
+}
+
 /** Pathname the host server mounts the offer-metadata serve route on. Exported so
  *  the route handler and the URI producer share one spelling. */
 export const OFFER_METADATA_PATH = "/v1/boson/offer-metadata";

@@ -1,0 +1,15 @@
+# Generator config for packages/sdk-python. Consumed by scripts/regenerate.sh via
+# `openapi-python-client generate --config`.
+#
+# post_hooks is pinned to an EMPTY list on purpose. The generator's DEFAULT
+# post-hooks run `ruff` when it happens to be on PATH, which makes the emitted
+# source depend on the machine that ran the generator rather than on the spec:
+# a developer with ruff installed produces deduplicated, re-sorted imports, while
+# a runner without it produces the raw output. The CI runner has no ruff, so the
+# committed tree is raw output, and anyone with ruff installed who regenerates
+# gets a spurious repo-wide diff and a red SDK-drift gate.
+#
+# Pinning the hooks here makes the output a function of the spec alone, the same
+# way the generator VERSION is already pinned to 0.28.4. Do not remove this file
+# or drop the --config flag without also changing what CI expects.
+post_hooks: []

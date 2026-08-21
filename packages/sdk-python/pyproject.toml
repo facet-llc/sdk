@@ -1,0 +1,71 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "facet-sdk"
+version = "0.2.0"
+description = "Facet Terminal Python SDK: typed client generated from openapi/openapi.yaml plus an ergonomic discovery + auth wrapper."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.9"
+authors = [
+  { name = "Facet", email = "hello@facet.llc" }
+]
+keywords = ["facet", "openapi", "agent", "commerce", "x402"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+  "attrs>=21.3.0",
+  "httpx>=0.20.0,<0.29.0",
+  "python-dateutil>=2.8.0; python_version < '3.11'",
+]
+
+[project.urls]
+Homepage = "https://facet.llc"
+Repository = "https://github.com/facet-llc/sdk"
+Issues = "https://github.com/facet-llc/sdk/issues"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.0.0",
+  "pytest-httpx>=0.21.0",
+  "openapi-python-client==0.28.4",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/facet_sdk", "src/facet_terminal_client"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "src/",
+  "tests/",
+  "scripts/",
+  "pyproject.toml",
+  "README.md",
+  "CHANGELOG.md",
+  "LICENSE",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+# Default `pytest` invocation skips smoke (uses `-m "not smoke"`) so
+# unit-test runs stay offline. The `sdk-smoke-test` CI tier opts in
+# with `pytest -m smoke`.
+addopts = "-ra --strict-markers -m 'not smoke'"
+markers = [
+  "smoke: hits a live Facet Terminal; gated to the sdk-smoke-test CI tier",
+]

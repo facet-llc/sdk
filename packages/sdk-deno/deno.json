@@ -1,0 +1,33 @@
+{
+  "name": "@facet-llc/sdk-deno",
+  "version": "0.2.0",
+  "description": "Agent-side Deno/JSR typed client + agents.txt discovery for the Facet Terminal protocol.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/facet-llc/sdk.git",
+    "directory": "packages/sdk-deno"
+  },
+  "exports": "./src/mod.ts",
+  "imports": {
+    "@facet-llc/adapter": "../adapter/src/index.ts",
+    "@facet-llc/client": "../client/src/index.ts",
+    "@std/assert": "jsr:@std/assert@^1.0.0",
+    "openapi-fetch": "npm:openapi-fetch@0.17.0"
+  },
+  "tasks": {
+    "check": "deno check src/mod.ts",
+    "lint": "deno lint",
+    "test": "deno test --allow-net=127.0.0.1,0.0.0.0,localhost --allow-read ./test/typed-client.test.ts ./test/discovery.test.ts ./test/version.test.ts",
+    "test:smoke": "deno test --allow-net=api.facet.llc,terminal.facet.llc,127.0.0.1 --allow-env=FACET_SMOKE_BASE_URL ./test/smoke.test.ts",
+    "regenerate": "bash scripts/regenerate.sh"
+  },
+  "lint": {
+    "include": ["src/", "test/"],
+    "exclude": ["src/generated/"]
+  },
+  "fmt": {
+    "include": ["src/", "test/"],
+    "exclude": ["src/generated/"]
+  }
+}

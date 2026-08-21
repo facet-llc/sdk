@@ -66,8 +66,8 @@ export interface StripeBalanceResponse {
 
 export interface StripeCheckoutSessionRequest {
   readonly site_id: string;
-  /** Constrained to paid tiers — "pro" or "enterprise". Use the
-   *  Stripe Customer Portal to downgrade to "free". */
+  /** One of the paid tiers: "starter", "pro", "pro_plus", or
+   *  "enterprise". Cancel the subscription in Stripe to revert to Starter. */
   readonly tier: SubscriptionTier;
   readonly email?: string;
 }

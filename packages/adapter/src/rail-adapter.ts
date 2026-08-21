@@ -174,6 +174,13 @@ export interface VerifyAuthorityOk {
   /** UTC ISO-8601 — when this authority stops being valid. Terminal
    *  uses this to set the quote expiry. Null for rails with no expiry. */
   readonly expires_at: string | null;
+  /** The address that actually pays: the ERC-3009 signer (from) for x402, the
+   *  buyer commit signer for Boson escrow. Surfaced so the Terminal can bind an
+   *  anchored buyer identity (a KYA wallet claim) to the party whose funds move,
+   *  before reserve/capture. Optional: adapters that cannot recover it omit it,
+   *  and the binding check treats an absent payer as unbindable (fail closed when
+   *  a binding is required). L3B Phase 0, Option A. */
+  readonly payer?: string;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

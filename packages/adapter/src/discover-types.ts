@@ -116,3 +116,90 @@ export interface DiscoverResponse {
   /** Offset to pass for the next page, or null when exhausted. */
   readonly next_offset: number | null;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /v1/discover_products: cross-merchant product search
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The catalog-plane sibling of /v1/discover: search products across every
+// merchant that opted into cross-merchant discovery (sites.discoverable_products).
+// SAFE-column projection happens server-side in public.facet_discover_products
+// (security-definer). A valid-KYA caller gets the full row below; a credential-less
+// or invalid-KYA caller is served a tightened 6-field subset (category + in_stock
+// withheld), offset forced to 0, and a tighter cap.
+
+export interface DiscoverProductsRequest {
+  /** Free-text search over product name + description. */
+  readonly query?: string;
+  /** Exact product category match. */
+  readonly category?: string;
+  /** Tag containment: every listed tag must be present on the product. */
+  readonly tags?: readonly string[];
+  /** Page size (default 20, capped server-side at 50). */
+  readonly limit?: number;
+  /** Page offset (default 0; forced to 0 on the credential-less public-safe path). */
+  readonly offset?: number;
+}
+
+/** A single cross-merchant product match. SAFE columns only: no internal
+ *  identifiers (the uuid PK, site_id), no cost, and never a row from a site
+ *  that has not opted into discoverable_products. */
+export interface DiscoverProductResult {
+  /** Agent-facing product id, unique within its merchant. */
+  readonly product_id: string;
+  readonly name: string;
+  readonly category: string;
+  /** Per-case price in the product's currency. */
+  readonly price: number;
+  readonly currency: string;
+  /** Whether the product has inventory available. */
+  readonly in_stock: boolean;
+  /** The selling merchant's display name. */
+  readonly merchant_name: string;
+  /** The selling merchant's Terminal entry point: point catalog + checkout
+   *  calls here. Live yields `https://<domain|terminal.facet.llc>/v1`; pre-live
+   *  yields `https://<handle>.sandbox.facet.llc/v1`. */
+  readonly terminal_url: string | null;
+}
+
+export interface DiscoverProductsResponse {
+  readonly results: readonly DiscoverProductResult[];
+  /** Estimated total matches across all pages (for paging UIs). */
+  readonly total_estimate: number;
+  /** Offset to pass for the next page, or null when exhausted. */
+  readonly next_offset: number | null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /v1/visual_search: VISUAL (image) product search
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The image-plane sibling of /v1/discover_products: match products across every
+// merchant that opted into cross-merchant discovery by VISUAL similarity to a
+// buyer-supplied image, returning the SAME safe per-row projection each carrying
+// the selling merchant's terminal_url. INFRA-GATED: dark (CAPABILITY_NOT_GRANTED)
+// until the Terminal has an image-embedding provider wired. Same dual projection,
+// rate limit, and credential-less offset-forcing as discover_products.
+
+export interface VisualSearchRequest {
+  /** Buyer-supplied https image URL to match products against. Validated
+   *  server-side (https-only + SSRF host guard) before any fetch; the URL and the
+   *  fetched bytes are never persisted. */
+  readonly image_url: string;
+  /** Page size (default 20, capped server-side at 50). */
+  readonly limit?: number;
+  /** Page offset (default 0; forced to 0 on the credential-less public-safe path). */
+  readonly offset?: number;
+}
+
+/** A visual-search match reuses the DiscoverProductResult shape (SAFE columns
+ *  only: no internal identifiers, no cost, never a non-opted row). */
+export type VisualSearchResult = DiscoverProductResult;
+
+export interface VisualSearchResponse {
+  readonly results: readonly DiscoverProductResult[];
+  /** Estimated total matches across all pages (for paging UIs). */
+  readonly total_estimate: number;
+  /** Offset to pass for the next page, or null when exhausted. */
+  readonly next_offset: number | null;
+}

@@ -1,7 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import { privateKeyToAccount } from "viem/accounts";
 
-import { X402CoinbaseAdapter, type SettlementConfirmer } from "../src/adapter.ts";
+import {
+  type ConsumingPaymentVerifier,
+  type SettlementConfirmer,
+  X402CoinbaseAdapter,
+} from "../src/adapter.ts";
 import { decodePaymentHeader, encodePaymentHeader } from "../src/payment-header.ts";
 
 // USDC EIP-712 domain on base-sepolia. Pulled directly from
@@ -118,7 +122,9 @@ function makeAdapterWithMockedFacilitator(opts: {
   settleSuccess?: boolean;
   settleTx?: `0x${string}`;
   settleErrorReason?: string;
+  settleThrows?: boolean;
   confirmSettlement?: SettlementConfirmer;
+  verifyConsumingPayment?: ConsumingPaymentVerifier;
   maxAuthWindowSeconds?: number;
   now?: () => number;
 }) {
@@ -158,6 +164,11 @@ function makeAdapterWithMockedFacilitator(opts: {
           // non-JSON body, leave uncaptured
         }
       }
+      if (opts.settleThrows) {
+        // Simulate a facilitator HTTP failure AFTER a possible on-chain broadcast: the
+        // settle() call rejects, driving the adapter's catch path.
+        throw new Error("facilitator settle request timed out");
+      }
       return new Response(JSON.stringify(settleResponse), {
         status: 200,
         headers: { "content-type": "application/json" },
@@ -172,6 +183,7 @@ function makeAdapterWithMockedFacilitator(opts: {
     network: "base-sepolia",
     facilitator: { url: "https://facilitator.test.local" },
     ...(opts.confirmSettlement ? { confirmSettlement: opts.confirmSettlement } : {}),
+    ...(opts.verifyConsumingPayment ? { verifyConsumingPayment: opts.verifyConsumingPayment } : {}),
     ...(opts.maxAuthWindowSeconds !== undefined
       ? { maxAuthWindowSeconds: opts.maxAuthWindowSeconds }
       : {}),
@@ -604,6 +616,157 @@ describe("X402CoinbaseAdapter hardening", () => {
     } finally {
       restore();
     }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Ambiguous-settle reconciliation: a failed or timed-out facilitator settle whose
+// transfer may already have landed on-chain must NOT be booked a clean, retryable
+// failure (which orphans the funds and invites a double-paying retry), and must NOT
+// be booked settled unless the EIP-3009 authorization ITSELF provably paid the
+// merchant. The adapter delegates that proof to `verifyConsumingPayment` (which binds
+// the Transfer paired with this authorization's AuthorizationUsed to payTo + amount):
+// { settled: tx } => captured with that tx; { settled: null } (unused nonce, a
+// self-transfer, or a bundled buy-one-get-many burn-nonce) => not_settled (no order);
+// no verifier, or the verifier throws => unconfirmed. The confirmer test file exercises
+// the payment-binding proof itself (`consumingAuthorizationPaid`) against the
+// buy-one-get-many log layout; here we test the adapter's use of the verdict.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("X402CoinbaseAdapter capture: ambiguous-settle reconciliation", () => {
+  async function captureWith(
+    opts: Parameters<typeof makeAdapterWithMockedFacilitator>[0],
+    nonce: `0x${string}`,
+  ) {
+    const header = await buildSignedHeader({
+      to: MERCHANT_ADDRESS,
+      value: "1000000",
+      validBefore: "1800000000",
+      nonce,
+    });
+    const { adapter, restore } = makeAdapterWithMockedFacilitator(opts);
+    try {
+      return await adapter.capture({
+        ctx,
+        merchant_config: { x402_pay_to_address: MERCHANT_ADDRESS },
+        authority_handle: nonce,
+        amount: { amount: 1000000, currency: "USDC" },
+        ...({ authority: { x_payment: header } } as unknown as object),
+      });
+    } finally {
+      restore();
+    }
+  }
+  // The tx that consumed the nonce (the verifier resolves + payment-binds it).
+  const CONSUMING_TX = `0x${"f1".repeat(32)}` as const;
+  // The authorization's own transfer provably paid payTo (a real, landed payment).
+  const paid: ConsumingPaymentVerifier = () => Promise.resolve({ settled: CONSUMING_TX });
+  // No proof of payment BY THIS authorization: an unused nonce, a self-transfer, or a
+  // bundled burn-nonce whose paired transfer was not to payTo (buy-one-get-many).
+  const notPaid: ConsumingPaymentVerifier = () => Promise.resolve({ settled: null });
+  const verifierThrows: ConsumingPaymentVerifier = () => Promise.reject(new Error("rpc down"));
+  const confirmerThrows: SettlementConfirmer = () =>
+    Promise.reject(new Error("confirmer rpc down"));
+
+  it("settle THROWS, the authorization provably PAID payTo, booked settled with the tx hash (the orphan fix)", async () => {
+    const r = await captureWith(
+      { settleThrows: true, verifyConsumingPayment: paid },
+      `0x${"b1".repeat(32)}`,
+    );
+    expect(r.kind).toBe("ok");
+    // The settlement id is the proven consuming tx, not the nonce.
+    if (r.kind === "ok") expect(r.value.settlement_id).toBe(CONSUMING_TX);
+  });
+
+  it("settle THROWS, the authorization did NOT pay payTo, NOT settled (theft-of-goods blocked)", async () => {
+    // The authorization's own transfer did not credit payTo (a self-transfer for 0, or a
+    // bundled burn-nonce). The verifier returns { settled: null }, so NO order is minted.
+    // This is the theft path the payment binding closes.
+    const r = await captureWith(
+      { settleThrows: true, verifyConsumingPayment: notPaid },
+      `0x${"b2".repeat(32)}`,
+    );
+    expect(r.kind).toBe("error");
+    if (r.kind === "error") {
+      expect(r.code).toBe("SETTLEMENT_FAILED");
+      // not_settled on the throw path is a genuine retryable failure (a fresh-nonce
+      // re-attempt is a NEW legitimate payment; the consumed nonce cannot re-settle).
+      expect(r.retryable).toBe(true);
+    }
+  });
+
+  it("settle THROWS with NO verifier, reported UNCONFIRMED (non-retryable), never a clean failure", async () => {
+    const r = await captureWith({ settleThrows: true }, `0x${"b3".repeat(32)}`);
+    expect(r.kind).toBe("error");
+    if (r.kind === "error") {
+      expect(r.code).toBe("SETTLEMENT_FAILED");
+      expect(r.native_code).toBe("settlement_unconfirmed");
+      expect(r.retryable).toBe(false);
+    }
+  });
+
+  it("settle THROWS and the verifier itself throws, still UNCONFIRMED (non-retryable)", async () => {
+    const r = await captureWith(
+      { settleThrows: true, verifyConsumingPayment: verifierThrows },
+      `0x${"b4".repeat(32)}`,
+    );
+    expect(r.kind).toBe("error");
+    if (r.kind === "error") expect(r.native_code).toBe("settlement_unconfirmed");
+  });
+
+  it("facilitator declines but the authorization PAID payTo (inclusion-wait timeout that landed), settled", async () => {
+    const r = await captureWith(
+      {
+        settleSuccess: false,
+        settleErrorReason: "settlement_timeout",
+        verifyConsumingPayment: paid,
+      },
+      `0x${"b5".repeat(32)}`,
+    );
+    expect(r.kind).toBe("ok");
+    if (r.kind === "ok") expect(r.value.settlement_id).toBe(CONSUMING_TX);
+  });
+
+  it("facilitator declines and the authorization did NOT pay payTo, decline returned verbatim (theft blocked)", async () => {
+    const r = await captureWith(
+      {
+        settleSuccess: false,
+        settleErrorReason: "settlement_timeout",
+        verifyConsumingPayment: notPaid,
+      },
+      `0x${"b6".repeat(32)}`,
+    );
+    expect(r.kind).toBe("error");
+    if (r.kind === "error") expect(r.native_code).toBe("settlement_timeout");
+  });
+
+  it("facilitator declines (insufficient_funds) with NO verifier, the decline is returned verbatim", async () => {
+    const r = await captureWith(
+      { settleSuccess: false, settleErrorReason: "insufficient_funds" },
+      `0x${"b7".repeat(32)}`,
+    );
+    expect(r.kind).toBe("error");
+    if (r.kind === "error") expect(r.native_code).toBe("insufficient_funds");
+  });
+
+  it("facilitator SUCCESS but the confirmer throws, then the authorization PAID payTo, settled", async () => {
+    // The confirmer-throw branch (success:true, on-chain confirm RPC hiccup) re-proves
+    // payment via the verifier rather than failing a settle whose money already moved.
+    const r = await captureWith(
+      { settleSuccess: true, confirmSettlement: confirmerThrows, verifyConsumingPayment: paid },
+      `0x${"b8".repeat(32)}`,
+    );
+    expect(r.kind).toBe("ok");
+    if (r.kind === "ok") expect(r.value.settlement_id).toBe(CONSUMING_TX);
+  });
+
+  it("facilitator SUCCESS but the confirmer throws and the authorization did NOT pay payTo, UNCONFIRMED", async () => {
+    const r = await captureWith(
+      { settleSuccess: true, confirmSettlement: confirmerThrows, verifyConsumingPayment: notPaid },
+      `0x${"b9".repeat(32)}`,
+    );
+    expect(r.kind).toBe("error");
+    if (r.kind === "error") expect(r.native_code).toBe("settlement_unconfirmed");
   });
 });
 

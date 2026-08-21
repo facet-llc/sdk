@@ -6,21 +6,23 @@ this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-21
+
 ### Added
 
 - **`fetchAgentsTxt` storefront discovery-pointer fallback + `Facet-Version:
 1.2` support.** On a `404` at `/.well-known/agents.txt`, discovery now falls
-  back to a storefront pointer — an HTTP `Link: <url>; rel="agents"` header, a
+  back to a storefront pointer: an HTTP `Link: <url>; rel="agents"` header, a
   `<link rel="agents" href>`, or a `<meta name="agents-txt" content>` in the
-  host's HTML (absolute-https only, one hop) — and fetches the manifest it names
-  (spec §7). This lets agents discover a Terminal on platforms that reserve
+  host's HTML (absolute-https only, one hop), and fetches the manifest it names
+  (spec section 7). This lets agents discover a Terminal on platforms that reserve
   `/.well-known/` (e.g. Shopify storefronts). Also adds `1.2` to
   `SUPPORTED_FACET_VERSIONS`: it's the version the live Terminal emits, and its
   absence made `discoverAndConnect` throw `UnsupportedVersionError` against every
   real merchant.
 - **Typed wire surface generated from
   `openapi/openapi.yaml`.** New exports:
-  - `createTerminalClient(opts)` — builds an `openapi-fetch` client
+  - `createTerminalClient(opts)`: builds an `openapi-fetch` client
     typed against the canonical spec. `.GET("/v1/health")` etc. return
     `{ data, error, response }` with discriminated-union narrowing for
     routes whose request body uses `oneOf + discriminator` (e.g.
@@ -28,13 +30,17 @@ this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   - Type-only re-exports: `paths`, `components`, `operations`,
     `CreateTerminalClientOptions`, `TypedTerminalClient`.
 - New dev script `scripts/regenerate.sh` that re-emits
-  `src/generated/schema.d.ts` from the spec. Idempotent — running
+  `src/generated/schema.d.ts` from the spec. Idempotent, running
   twice produces no diff unless the spec changed. Wired into the
   top-level `scripts/regenerate-sdks.sh` orchestrator.
 - Smoke test suite (`test/smoke.test.ts`) that drives the typed client
-  against a live Facet Terminal — gated to the `sdk-smoke-test` CI
+  against a live Facet Terminal, gated to the `sdk-smoke-test` CI
   tier via a separate `vitest.smoke.config.ts`. Override the target
   with `FACET_SMOKE_BASE_URL`.
+- Regenerated `src/generated/schema.d.ts` from the current OpenAPI spec,
+  adding typed coverage for new route families: UCP checkout-sessions,
+  per-line Boson escrow, MPP charge, refund/resolve, deferred-redeem relay,
+  owner-scoped get_signatures, and the public `/v1/stores` directory.
 
 ### Changed
 
